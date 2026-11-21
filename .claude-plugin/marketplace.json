@@ -1,0 +1,13 @@
+{
+  "name": "gigi-claude",
+  "owner": { "name": "Grateful" },
+  "metadata": { "description": "Gigi for Claude Code, from the AgentOS bootcamp." },
+  "plugins": [
+    {
+      "name": "gigi",
+      "source": "./gigi",
+      "description": "Gigi, your Claude Code coach for the AgentOS bootcamp.",
+      "version": "1.0.0"
+    }
+  ]
+}

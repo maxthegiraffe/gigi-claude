@@ -1,0 +1,9 @@
+{
+  "name": "gigi",
+  "description": "Gigi, your Claude Code coach for the AgentOS bootcamp: usage, checkup, fresh start, tidy, undo, what to build first, and quick fixes when you're stuck.",
+  "version": "1.0.0",
+  "author": { "name": "Grateful" },
+  "homepage": "https://github.com/maxthegiraffe/gigi-claude",
+  "repository": "https://github.com/maxthegiraffe/gigi-claude",
+  "keywords": ["coach", "bootcamp", "agentos", "usage", "handoff"]
+}
