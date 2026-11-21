@@ -1,0 +1,10 @@
+#!/bin/sh
+# Runs coach.py for a hook. Quiet, and exit 0, whenever Python can't run here (the Windows Store stand-in, or a Mac
+# without Apple's developer tools, whose /usr/bin/python3 would ask to install them on every message).
+here="${0%/*}"
+py=$(command -v python3 2>/dev/null) || exit 0
+if [ "$py" = /usr/bin/python3 ] && [ -x /usr/bin/xcode-select ]; then
+  /usr/bin/xcode-select -p >/dev/null 2>&1 || exit 0
+fi
+"$py" "$here/coach.py" "$@" 2>/dev/null
+exit 0

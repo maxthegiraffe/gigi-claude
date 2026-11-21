@@ -12,7 +12,8 @@ allowed-tools: Bash(python3:*)
 4. On their yes, do exactly the ones they named:
    - Use the Claude app's own sidebar and settings tools. Load them first if they are listed but not loaded.
    - A group: list the groups, reuse one that matches, else create it, then move the threads. Threads already there need nothing.
-   - Archiving: one call per thread. For more than 25, turn on "archive inactive sessions" at 14 days instead.
+   - Archiving: one call per thread, only the threads they said yes to.
+   - The Claude app's "archive inactive sessions" setting is a lasting change: offer it only as its own numbered item that says it is a setting, and turn it on only if they say yes to that item.
    - Never delete a thread, a file or a group. Never touch a pinned or running thread, or this one.
    - Without sidebar tools: don't improvise. Tell them the clicks for each item, in order.
 5. Finish with one line per item: what changed, or why it didn't.

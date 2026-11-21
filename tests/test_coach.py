@@ -220,7 +220,7 @@ class ThreadCheckTest(unittest.TestCase):
         self.assertIsNone(hook(h, "thread-check", session_id="p", prompt="still Overloaded"))
         for ok in ["hello", "write my newsletter about the error of our ways"]:
             self.assertIsNone(hook(h, "thread-check", session_id="q", prompt=ok), ok)
-        for bad in ["zsh: command not found: claude", "API Error: 500", "Prompt is too long", "it says I'm not logged in", "I'm stuck"]:
+        for bad in ["zsh: command not found: claude", "API Error: 500", "Prompt is too long", "Not logged in · Please run /login"]:
             self.assertIsNotNone(hook(h, "thread-check", session_id="r" + bad, prompt=bad), bad)
 
     def test_thread_check_big_is_fast(self):
@@ -231,6 +231,89 @@ class ThreadCheckTest(unittest.TestCase):
         sys.path.insert(0, SCRIPTS)
         self.assertEqual(coach.thread_tokens(t), 170_000)
         self.assertLess(time.time() - started, 0.2)
+
+
+class ReviewFixTest(unittest.TestCase):
+    """Fixes from the review of 2026-11-20."""
+
+    def test_business_prompts_are_not_problems(self):
+        h = Home()
+        for ok in ["Write a promo for our $1,529 coaching package", "I'm overloaded this week, plan my Monday",
+                   "This headline doesn't work, try three more", "My Facebook ads are not working, ideas?",
+                   "I'm stuck on what to name my new product", "customers get logged out of Shopify", "call 415-529-0000",
+                   "our 529 college plan", "I'm overloaded, I'm stuck at $10k a month"]:
+            self.assertIsNone(hook(h, "thread-check", session_id="b" + ok, prompt=ok), ok)
+        for bad in ["API Error: 529 {\"type\":\"overloaded_error\"}", "it says Overloaded error", "529 overloaded",
+                    "Prompt is too long", "zsh: command not found: claude", "it says Please run /login", "API Error: 500"]:
+            out = hook(h, "thread-check", session_id="e" + bad, prompt=bad)
+            self.assertIn("gigi:stuck", out["hookSpecificOutput"]["additionalContext"], bad)
+            self.assertIn("only if", out["hookSpecificOutput"]["additionalContext"].lower())
+
+    def git_kit(self):
+        h = Home()
+        k = h.kit(setup=True)
+        run = lambda *a: subprocess.run(["git", "-C", k, *a], capture_output=True, text=True, check=True)
+        run("init", "-q")
+        run("-c", "user.name=t", "-c", "user.email=t@t", "add", "-A")
+        run("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "save")
+        return h, k
+
+    def test_undo_keeps_a_copy(self):
+        h, k = self.git_kit()
+        h.write(f"{KIT_REL}/context/me.md", "my own edits")
+        h.write(f"{KIT_REL}/new.md", "brand new")
+        ch = json.loads(h.run("changes", stdin="").stdout if False else subprocess.run(
+            [sys.executable, os.path.join(SCRIPTS, "coach.py"), "changes"], capture_output=True, text=True, cwd=k,
+            env=dict(os.environ, HOME=h.path)).stdout)
+        states = {c["path"]: c["state"] for c in ch["changed"]}
+        self.assertEqual(states, {"context/me.md": "changed", "new.md": "new"})
+        r = subprocess.run([sys.executable, os.path.join(SCRIPTS, "coach.py"), "restore", "context/me.md", "new.md"],
+                           capture_output=True, text=True, cwd=k, env=dict(os.environ, HOME=h.path))
+        res = {x["path"]: x for x in json.loads(r.stdout)}
+        self.assertTrue(res["context/me.md"]["restored"])
+        self.assertEqual(open(os.path.join(k, "context/me.md")).read(), "me")
+        self.assertEqual(open(res["context/me.md"]["backup"]).read(), "my own edits")
+        self.assertFalse(res["new.md"]["restored"])
+        self.assertTrue(os.path.exists(os.path.join(k, "new.md")))
+        again = json.loads(subprocess.run([sys.executable, os.path.join(SCRIPTS, "coach.py"), "changes"], capture_output=True,
+                                          text=True, cwd=k, env=dict(os.environ, HOME=h.path)).stdout)
+        self.assertEqual([c["path"] for c in again["changed"]], ["new.md"])
+
+    def test_hook_wrapper_is_quiet_without_python(self):
+        r = subprocess.run(["/bin/sh", os.path.join(SCRIPTS, "run-hook"), "thread-check"], input="{}", capture_output=True,
+                           text=True, env={"PATH": "/nonexistent", "HOME": tempfile.gettempdir()})
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""))
+        h = Home()
+        r = subprocess.run(["/bin/sh", os.path.join(SCRIPTS, "run-hook"), "thread-check"], input=json.dumps({"session_id": "w", "prompt": "Prompt is too long"}),
+                           capture_output=True, text=True, env=dict(os.environ, HOME=h.path))
+        self.assertIn("gigi:stuck", r.stdout)
+
+    def test_off_a_mac(self):
+        h = Home()
+        names = [r["name"] for r in coach.checkup(h.path, h.path, quick=False, plat="win32")]
+        self.assertNotIn("Claude app up to date", names)
+        self.assertEqual(json.loads(h.run("usage").stdout)["platform"], sys.platform)
+
+    def test_start_check_fresh_and_once(self):
+        h = Home()
+        k = h.kit(setup=True)
+        h.meter(85, 40, age_s=2 * 3600)
+        self.assertIsNone(hook(h, "session-start", cwd=k, session_id="s1"), "a 5-hour number 2 hours old is stale")
+        h.meter(85, 40, age_s=10 * 60)
+        self.assertIsNotNone(hook(h, "session-start", cwd=k, session_id="s1"))
+        self.assertIsNone(hook(h, "session-start", cwd=k, session_id="s2"), "not again on resume or /clear")
+
+    def test_said_file_under_four_sessions(self):
+        h = Home()
+        code = "import sys; sys.path.insert(0, sys.argv[1]); import coach\nfor i in range(50): coach.first_time(sys.argv[2], sys.argv[3] + str(i), 'k')"
+        ps = [subprocess.Popen([sys.executable, "-c", code, SCRIPTS, h.path, f"s{n}-"], stderr=subprocess.PIPE, text=True) for n in range(4)]
+        errs = [p.communicate()[1] for p in ps]
+        self.assertEqual(errs, ["", "", "", ""])
+        json.load(open(os.path.join(h.path, ".claude/gigi-plugin/said.json")))
+
+    def test_small_app_updates_are_fine(self):
+        self.assertTrue(coach.newer_or_same("6.28899.2", "6.28899.6"))
+        self.assertFalse(coach.newer_or_same("6.28800.9", "6.28899.0"))
 
 
 if __name__ == "__main__":

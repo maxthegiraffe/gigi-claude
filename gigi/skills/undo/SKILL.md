@@ -1,16 +1,18 @@
 ---
 name: undo
-description: Use when the person wants to undo what Claude changed, get a file back, "put it back", "what did you change", "I lost my work", or runs /gigi:undo. Shows what changed in the kit and puts back only the files they pick, on their yes.
-allowed-tools: Bash(python3:*), Bash(git status:*), Bash(git diff:*), Bash(git log:*), Bash(git restore:*), Bash(git show:*)
+description: Use when the person wants to undo a change, get a file back, "put it back", "what changed", "I lost my work", or runs /gigi:undo. Shows what changed in the kit since the last save and puts back only the files they pick, on their yes, keeping a copy of what it replaces.
+allowed-tools: Bash(python3:*)
 ---
 
 # Undo
 
-Their kit is saved with git, so anything since the last save can be put back.
+Their kit is saved with git, so anything since the last save can be put back. `<base>` below is this skill's base directory (shown above as "Base directory for this skill").
 
-1. Find the kit: `python3 "<base>/../../scripts/coach.py" kit`, where `<base>` is this skill's base directory (shown above as "Base directory for this skill"); with nothing, use the current folder. Run git with `-C "<kit>"`.
-2. Show what changed since the last save: `git -C "<kit>" status --short` and `git -C "<kit>" diff --stat`. Say it in plain words: "Claude changed 3 files and added 2: ..." Group by folder when there are many. New files are listed as new; they are only removed if they ask.
-3. Ask which to put back. Their reply naming files is the yes.
-4. Put back exactly those: `git -C "<kit>" restore -- <files>` for changed or deleted files. For a new file they want gone, tell them it goes to the Trash from Finder; never delete files yourself.
-5. An older version (before the last save): show `git -C "<kit>" log --oneline -10 -- <file>`, and on their yes `git -C "<kit>" restore --source <commit> -- <file>`.
-6. Never commit, push, reset, or clean. Finish with what was put back.
+1. Run `python3 "<base>/../../scripts/coach.py" changes`. It prints JSON: `kit`, `last_save` (when, and its note), and `changed` (each `path` with `state`: changed, deleted or new).
+2. Say it in plain words: "Since your last save (2 days ago), 3 files changed and 2 are new: ..." Group by folder when there are many. These are changes by Claude or by them; don't say Claude made them all.
+3. Ask which to put back. Their reply naming files is the yes. "All of it" means you list them once more and ask again.
+4. Run `python3 "<base>/../../scripts/coach.py" restore <path> <path> ...` with the paths as listed. It puts each back from the last save and first copies the current version to `.gigi-undo/<time>/` in the kit. New files are left as they are.
+5. Tell them what came back, and that the versions they replaced are kept in `.gigi-undo` in their kit if they change their mind. For a new file they want gone: they move it to the Trash in Finder; you never delete files.
+6. An older version, before the last save: tell them older versions need a person from the bootcamp team, so nothing is lost by guessing.
+
+Never commit, push, reset, clean or delete.

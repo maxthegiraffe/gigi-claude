@@ -4,6 +4,8 @@
   coach.py usage                 the plan meter and the fullest Claude Code threads, as JSON
   coach.py checkup               the usual causes of trouble, as JSON rows {name, ok, fix}
   coach.py threads               the last 14 days of Claude Code threads (open, waiting on them, clusters), as JSON
+  coach.py changes               what changed in the kit since the last save, as JSON
+  coach.py restore [--from C] F  put files back from the last save (or commit C), keeping a copy in .gigi-undo/
   coach.py kit                   the AgentOS kit folder, or nothing
   coach.py handoff-link FILE     the Claude link that opens a new thread on a handoff note (opened on a Mac)
   coach.py session-start         hook: a line when the plan is nearly used, a note when /setup hasn't run
@@ -13,6 +15,7 @@ It only reads. The hooks print nothing when there is nothing to say and never fa
 """
 import json
 import os
+import re
 import sys
 import time
 
@@ -97,10 +100,13 @@ def handoff_link(kit, note):
 
 # ---- checkup
 
-def sh(cmd, timeout=12):
+def sh(cmd, timeout=12, plat=None):
     import subprocess
     try:
-        r = subprocess.run(["/bin/zsh", "-lc", cmd], capture_output=True, text=True, timeout=timeout)
+        if (plat or sys.platform) == "darwin":
+            r = subprocess.run(["/bin/zsh", "-lc", cmd], capture_output=True, text=True, timeout=timeout)
+        else:
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
         return r.returncode == 0, r.stdout
     except (OSError, subprocess.SubprocessError):
         return False, ""
@@ -128,38 +134,42 @@ def latest_version():
 def newer_or_same(installed, latest):
     if not latest:
         return True
-    a = [int(x) if x.isdigit() else 0 for x in installed.split(".")]
-    b = [int(x) if x.isdigit() else 0 for x in latest.split(".")]
+    a = [int(x) if x.isdigit() else 0 for x in installed.split(".")][:2]
+    b = [int(x) if x.isdigit() else 0 for x in latest.split(".")][:2]
     n = max(len(a), len(b))
     return (a + [0] * (n - len(a))) >= (b + [0] * (n - len(b)))
 
 
-def checkup(home, cwd, quick=False):
+def checkup(home, cwd, quick=False, plat=None):
     """Gigi's checkup, worded for Claude Code. quick skips the checks that run programs or reach the internet."""
     from concurrent.futures import ThreadPoolExecutor
+    plat = plat or sys.platform
+    mac = plat == "darwin"
     rows = []
     kit = find_kit(cwd, home)
     slow = {}
     if not quick:
         with ThreadPoolExecutor(max_workers=6) as pool:
             jobs = {
-                "claude": pool.submit(sh, "claude auth status"),
-                "gh": pool.submit(sh, "gh auth status"),
-                "git": pool.submit(sh, "git --version"),
-                "app": pool.submit(app_version),
-                "latest": pool.submit(latest_version),
-                "mcp": pool.submit(sh, f"cd {json.dumps(kit or home)} && claude mcp list", 20),
-                "changes": pool.submit(sh, f"git -C {json.dumps(kit)} status --porcelain" if kit else "true"),
+                "claude": pool.submit(sh, "claude auth status", 12, plat),
+                "gh": pool.submit(sh, "gh auth status", 12, plat),
+                "git": pool.submit(sh, "git --version", 12, plat),
+                "mcp": pool.submit(sh, f"cd {json.dumps(kit or home)} && claude mcp list", 20, plat),
+                "changes": pool.submit(sh, f"git -C {json.dumps(kit)} status --porcelain" if kit else "git --version", 12, plat),
             }
+            if mac:
+                jobs["app"] = pool.submit(app_version)
+                jobs["latest"] = pool.submit(latest_version)
             slow = {k: j.result() for k, j in jobs.items()}
         rows.append({"name": "Claude Code signed in", "ok": slow["claude"][0],
                      "fix": "Claude Code needs its own sign in, even when the Claude app is signed in. In Terminal, type: claude auth login"})
         rows.append({"name": "GitHub signed in", "ok": slow["gh"][0],
                      "fix": "GitHub isn't signed in, so saving your kit to GitHub will fail. In Terminal, type: gh auth login, then follow the code it shows."})
-        app = slow["app"]
-        rows.append({"name": "Claude app up to date", "ok": app is not None and newer_or_same(app, slow["latest"]),
-                     "fix": "I can't find the Claude app. Download it from claude.ai/download." if app is None
-                     else f"Your Claude app ({app}) is out of date. Quit it and open it again to update, or download it from claude.ai/download."})
+        app = slow.get("app")
+        if mac:
+            rows.append({"name": "Claude app up to date", "ok": app is not None and newer_or_same(app, slow["latest"]),
+                         "fix": "I can't find the Claude app. Download it from claude.ai/download." if app is None
+                         else f"Your Claude app ({app}) is out of date. Quit it and open it again to update, or download it from claude.ai/download."})
     rows.append({"name": "AgentOS kit found", "ok": kit is not None,
                  "fix": "I can't find your AgentOS kit. It should be in Documents/Claude Code/agentic-business-os-pkg. Ask the bootcamp team to help install it."})
     if kit:
@@ -178,6 +188,68 @@ def checkup(home, cwd, quick=False):
     return rows
 
 
+# ---- undo: what changed since the last save, and putting files back with a copy kept
+
+def git(kit, *args):
+    import subprocess
+    return subprocess.run(["git", "-C", kit, *args], capture_output=True, text=True, timeout=20)
+
+
+def keep_backups_out(kit):
+    """Her copies never show up as changes: .gigi-undo/ goes in git's local exclude list (never committed)."""
+    p = os.path.join(kit, ".git", "info", "exclude")
+    try:
+        text = open(p).read() if os.path.exists(p) else ""
+        if ".gigi-undo/" not in text.split():
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "a") as h:
+                h.write(("" if text.endswith("\n") or not text else "\n") + ".gigi-undo/\n")
+    except OSError:
+        pass
+
+
+def changes(kit):
+    keep_backups_out(kit)
+    out = git(kit, "status", "--porcelain", "-z", "--untracked-files=all").stdout.split("\0")
+    rows, i = [], 0
+    while i < len(out):
+        e = out[i]
+        i += 1
+        if len(e) < 4:
+            continue
+        xy, path = e[:2], e[3:]
+        if xy[0] in "RC":
+            i += 1   # the old name follows a rename
+        state = "new" if xy == "??" else "deleted" if "D" in xy else "changed"
+        rows.append({"path": path, "state": state})
+    last = git(kit, "log", "-1", "--format=%cr: %s").stdout.strip()
+    return {"kit": kit, "last_save": last, "changed": rows}
+
+
+def restore(kit, paths, source="HEAD"):
+    import shutil
+    keep_backups_out(kit)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    results = []
+    for p in paths:
+        rel = os.path.normpath(p)
+        if os.path.isabs(rel) or rel.startswith(".."):
+            results.append({"path": p, "restored": False, "backup": None, "why": "outside the kit"})
+            continue
+        if git(kit, "cat-file", "-e", f"{source}:{rel}").returncode != 0:
+            results.append({"path": rel, "restored": False, "backup": None,
+                            "why": "new since that save, so there is nothing to put back; it stays as it is"})
+            continue
+        cur, backup = os.path.join(kit, rel), None
+        if os.path.isfile(cur):
+            backup = os.path.join(kit, ".gigi-undo", stamp, rel)
+            os.makedirs(os.path.dirname(backup), exist_ok=True)
+            shutil.copy2(cur, backup)
+        ok = git(kit, "checkout", source, "--", rel).returncode == 0
+        results.append({"path": rel, "restored": ok, "backup": backup, "why": "" if ok else "git could not put it back"})
+    return results
+
+
 # ---- the two quiet checks (hooks): they tell, never block, and print nothing when there is nothing to say
 
 def said_file(home):
@@ -185,23 +257,36 @@ def said_file(home):
 
 
 def first_time(home, session, key):
-    """True the first time this note comes up in this thread; remembered for the newest 200 threads."""
+    """True the first time this note comes up in this thread; remembered for the newest 200 threads. Safe when several
+    sessions write at once: one lock, and a temp file of its own."""
+    import tempfile
     p = said_file(home)
+    folder = os.path.dirname(p)
+    os.makedirs(folder, exist_ok=True)
+    lock = open(p + ".lock", "a")
     try:
-        with open(p) as h:
-            said = json.load(h)
-    except (OSError, ValueError):
-        said = {}
-    keys = said.pop(session, [])
-    fresh = key not in keys
-    said[session] = keys + ([key] if fresh else [])
-    said = dict(list(said.items())[-200:])
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    tmp = p + ".tmp"
-    with open(tmp, "w") as h:
-        json.dump(said, h)
-    os.replace(tmp, p)
-    return fresh
+        try:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        except ImportError:
+            pass
+        try:
+            with open(p) as h:
+                said = json.load(h)
+            said = said if isinstance(said, dict) else {}
+        except (OSError, ValueError):
+            said = {}
+        keys = said.pop(session, [])
+        fresh = key not in keys
+        said[session] = keys + ([key] if fresh else [])
+        said = dict(list(said.items())[-200:])
+        fd, tmp = tempfile.mkstemp(dir=folder, prefix="said.", suffix=".tmp")
+        with os.fdopen(fd, "w") as h:
+            json.dump(said, h)
+        os.replace(tmp, p)
+        return fresh
+    finally:
+        lock.close()
 
 
 def k(n):
@@ -213,12 +298,15 @@ def session_start(home, payload):
     show, notes = [], []
     m = meter(home)
     if m and m["age_min"] < 360:
-        if (m.get("fh") or 0) >= 80:
+        if (m.get("fh") or 0) >= 80 and m["age_min"] < 60:
             show.append(f"{m['fh']}% of your 5-hour Claude limit")
         if (m.get("sd") or 0) >= 80:
             show.append(f"{m['sd']}% of this week's plan")
     if show:
         line = " and ".join(show)
+        if not first_time(home, "_start", f"{line}:{int(time.time() // (3 * 3600))}"):
+            show = []
+    if show:
         notes.append(f"Gigi plugin: the person has used {line} (the Claude app's meter, {m['age_min']} min old). If they start something "
                      "heavy, mention it once in one line and suggest /gigi:usage. Don't block or repeat it.")
     if is_kit(cwd) and not setup_done(cwd):
@@ -232,19 +320,19 @@ def session_start(home, payload):
     return out
 
 
-PROBLEM_WORDS = ["overloaded", "529", "api error", "prompt is too long", "context limit", "command not found", "permission denied",
-                 "not logged in", "logged out", "please run /login", "usage limit", "rate limit", "limit reached", "i'm stuck", "im stuck",
-                 "it's stuck", "not working", "doesn't work", "won't open", "no module named", "error:"]
+PROBLEM = re.compile(r"api error|overloaded_error|overloaded error|\bsay(s|ing)? overloaded\b|\b529\b.{0,20}\b(error|overloaded)\b|"
+                     r"\b(error|overloaded)\b.{0,20}\b529\b|prompt is too long|command not found|please run /login|no module named|"
+                     r"permission denied|rate_limit_error|usage limit reached", re.I)
 
 
 def thread_check(home, payload):
     session = str(payload.get("session_id") or "none")
     notes = []
-    said = (payload.get("prompt") or "").lower()
-    hit = next((w for w in PROBLEM_WORDS if w in said), None)
-    if hit and first_time(home, session, "problem:" + hit):
-        notes.append("Gigi plugin: they may have hit a known bootcamp problem. Load the gigi:stuck skill with the Skill tool and answer "
-                     "from it: the fix first, plain words, a few short lines.")
+    hit = PROBLEM.search(str(payload.get("prompt") or ""))
+    if hit and first_time(home, session, "problem:" + hit.group(0).lower()):
+        notes.append("Gigi plugin: their message quotes what looks like an error. Only if it is about Claude Code, the Claude app or the "
+                     "kit misbehaving (not their business content): load the gigi:stuck skill with the Skill tool and answer from it, "
+                     "the fix first, in plain words, a few short lines.")
     tokens = thread_tokens(payload.get("transcript_path"))
     if tokens:
         w = window(tokens)
@@ -282,6 +370,7 @@ def main(argv):
             out = sweep.usage(home)
         except Exception:
             out = {"meter": meter(home), "threads": []}
+        out["platform"] = sys.platform   # the plan meter is read from the Claude app's files on a Mac only
         print(json.dumps(out))
     elif cmd == "threads":
         sys.path.insert(0, HERE)
@@ -293,6 +382,13 @@ def main(argv):
         return run_hook(session_start, home)
     elif cmd == "thread-check":
         return run_hook(thread_check, home)
+    elif cmd == "changes":
+        print(json.dumps(changes(find_kit(os.getcwd(), home) or os.getcwd())))
+    elif cmd == "restore" and len(argv) > 2:
+        args, source = argv[2:], "HEAD"
+        if args[0] == "--from" and len(args) > 2:
+            source, args = args[1], args[2:]
+        print(json.dumps(restore(find_kit(os.getcwd(), home) or os.getcwd(), args, source)))
     elif cmd == "kit":
         print(find_kit(os.getcwd(), home) or "")
     elif cmd == "handoff-link" and len(argv) > 2:
