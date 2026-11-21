@@ -107,6 +107,15 @@ class MeterTest(unittest.TestCase):
         self.assertEqual(coach.window(250_000), 1_000_000)
 
 
+class ThreadsTest(unittest.TestCase):
+    def test_threads_empty(self):
+        h = Home()
+        r = h.run("threads")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(json.loads(r.stdout)["empty"])
+        self.assertFalse(os.path.exists(os.path.join(h.path, "Library/Application Support/Gigi Helper")))
+
+
 class LinkTest(unittest.TestCase):
     def test_handoff_link(self):
         h = Home()
@@ -116,6 +125,16 @@ class LinkTest(unittest.TestCase):
         self.assertIn("2026-11-21-pricing-page.md", unquote(link))
         self.assertIn("folder=" + k, unquote(link))
         self.assertLess(len(link), 600)
+
+    def test_handoff_link_says_if_opened(self):
+        h = Home()
+        k = h.kit(setup=True)
+        note = h.write(f"{KIT_REL}/handoffs/2026-11-21-x.md", "note")
+        env = dict(os.environ, HOME=h.path, GIGI_NO_OPEN="1")
+        r = subprocess.run([sys.executable, os.path.join(SCRIPTS, "coach.py"), "handoff-link", note], capture_output=True, text=True, env=env, cwd=k)
+        lines = r.stdout.strip().splitlines()
+        self.assertTrue(lines[0].startswith("claude://code/new?q="))
+        self.assertEqual(lines[1], "opened: no")
 
 
 def hook(h, sub, **payload):
@@ -193,6 +212,16 @@ class ThreadCheckTest(unittest.TestCase):
         for stdin in ["", "not json", "[]"]:
             r = h.run("thread-check", stdin=stdin)
             self.assertEqual((r.returncode, r.stdout), (0, ""), stdin)
+
+    def test_problem_words_point_at_the_guide(self):
+        h = Home()
+        out = hook(h, "thread-check", session_id="p", prompt="it keeps saying Overloaded, what do I do")
+        self.assertIn("gigi:stuck", out["hookSpecificOutput"]["additionalContext"])
+        self.assertIsNone(hook(h, "thread-check", session_id="p", prompt="still Overloaded"))
+        for ok in ["hello", "write my newsletter about the error of our ways"]:
+            self.assertIsNone(hook(h, "thread-check", session_id="q", prompt=ok), ok)
+        for bad in ["zsh: command not found: claude", "API Error: 500", "Prompt is too long", "it says I'm not logged in", "I'm stuck"]:
+            self.assertIsNotNone(hook(h, "thread-check", session_id="r" + bad, prompt=bad), bad)
 
     def test_thread_check_big_is_fast(self):
         h = Home()

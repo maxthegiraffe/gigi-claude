@@ -3,6 +3,7 @@
 
   coach.py usage                 the plan meter and the fullest Claude Code threads, as JSON
   coach.py checkup               the usual causes of trouble, as JSON rows {name, ok, fix}
+  coach.py threads               the last 14 days of Claude Code threads (open, waiting on them, clusters), as JSON
   coach.py kit                   the AgentOS kit folder, or nothing
   coach.py handoff-link FILE     the Claude link that opens a new thread on a handoff note (opened on a Mac)
   coach.py session-start         hook: a line when the plan is nearly used, a note when /setup hasn't run
@@ -231,18 +232,31 @@ def session_start(home, payload):
     return out
 
 
+PROBLEM_WORDS = ["overloaded", "529", "api error", "prompt is too long", "context limit", "command not found", "permission denied",
+                 "not logged in", "logged out", "please run /login", "usage limit", "rate limit", "limit reached", "i'm stuck", "im stuck",
+                 "it's stuck", "not working", "doesn't work", "won't open", "no module named", "error:"]
+
+
 def thread_check(home, payload):
+    session = str(payload.get("session_id") or "none")
+    notes = []
+    said = (payload.get("prompt") or "").lower()
+    hit = next((w for w in PROBLEM_WORDS if w in said), None)
+    if hit and first_time(home, session, "problem:" + hit):
+        notes.append("Gigi plugin: they may have hit a known bootcamp problem. Load the gigi:stuck skill with the Skill tool and answer "
+                     "from it: the fix first, plain words, a few short lines.")
     tokens = thread_tokens(payload.get("transcript_path"))
-    if not tokens:
+    if tokens:
+        w = window(tokens)
+        marks = [m for m in ((160_000, 180_000) if w == 200_000 else (800_000, 900_000)) if tokens >= m]
+        if marks and first_time(home, session, f"{w}:{marks[-1]}"):
+            notes.append(f"Gigi plugin: this thread is now {k(tokens)} tokens long ({round(tokens * 100 / w)}% of its {k(w)} window), so "
+                         "every reply is slower and uses more of their plan, and details may get lost when Claude compacts it. Before "
+                         "answering, tell them in one short line and offer /gigi:fresh-start (a handoff note and a new thread with it). "
+                         "Say it once, then do what they asked.")
+    if not notes:
         return None
-    w = window(tokens)
-    marks = [m for m in ((160_000, 180_000) if w == 200_000 else (800_000, 900_000)) if tokens >= m]
-    if not marks or not first_time(home, str(payload.get("session_id") or "none"), f"{w}:{marks[-1]}"):
-        return None
-    note = (f"Gigi plugin: this thread is now {k(tokens)} tokens long ({round(tokens * 100 / w)}% of its {k(w)} window), so every "
-            "reply is slower and uses more of their plan, and details may get lost when Claude compacts it. Before answering, tell them "
-            "in one short line and offer /gigi:fresh-start (a handoff note and a new thread with it). Say it once, then do what they asked.")
-    return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": note}}
+    return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "\n".join(notes)}}
 
 
 def run_hook(fn, home):
@@ -269,6 +283,10 @@ def main(argv):
         except Exception:
             out = {"meter": meter(home), "threads": []}
         print(json.dumps(out))
+    elif cmd == "threads":
+        sys.path.insert(0, HERE)
+        import sweep
+        print(sweep.dump(sweep.fit(sweep.build(home, 14))))
     elif cmd == "checkup":
         print(json.dumps(checkup(home, os.getcwd())))
     elif cmd == "session-start":
@@ -282,9 +300,11 @@ def main(argv):
         kit = find_kit(os.getcwd(), home) or os.path.dirname(os.path.dirname(note))
         link = handoff_link(kit, note)
         print(link)
-        if sys.platform == "darwin" and "--no-open" not in argv:
+        opened = False
+        if sys.platform == "darwin" and "--no-open" not in argv and not os.environ.get("GIGI_NO_OPEN"):
             import subprocess
-            subprocess.run(["/usr/bin/open", link], check=False)
+            opened = subprocess.run(["/usr/bin/open", link], check=False, capture_output=True).returncode == 0
+        print(f"opened: {'yes' if opened else 'no'}")
     else:
         print(__doc__.strip())
         return 2
