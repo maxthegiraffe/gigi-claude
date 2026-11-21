@@ -118,5 +118,91 @@ class LinkTest(unittest.TestCase):
         self.assertLess(len(link), 600)
 
 
+def hook(h, sub, **payload):
+    r = h.run(sub, stdin=json.dumps(payload))
+    assert r.returncode == 0, r.stderr
+    return json.loads(r.stdout) if r.stdout.strip() else None
+
+
+class SessionStartTest(unittest.TestCase):
+    def test_session_start_high(self):
+        h = Home()
+        k = h.kit(setup=True)
+        h.meter(85, 40, age_s=300)
+        out = hook(h, "session-start", cwd=k, session_id="s1")
+        self.assertIn("85%", out["systemMessage"])
+        self.assertIn("5-hour", out["systemMessage"])
+        self.assertEqual(out["hookSpecificOutput"]["hookEventName"], "SessionStart")
+        h.meter(50, 81)
+        self.assertIn("week", hook(h, "session-start", cwd=k, session_id="s1")["systemMessage"])
+
+    def test_session_start_quiet(self):
+        h = Home()
+        k = h.kit(setup=True)
+        h.meter(70, 40)
+        self.assertIsNone(hook(h, "session-start", cwd=k, session_id="s1"))
+
+    def test_session_start_stale(self):
+        h = Home()
+        k = h.kit(setup=True)
+        h.meter(85, 85, age_s=7 * 3600)
+        self.assertIsNone(hook(h, "session-start", cwd=k, session_id="s1"))
+
+    def test_session_start_setup(self):
+        h = Home()
+        k = h.kit(setup=False)
+        out = hook(h, "session-start", cwd=k, session_id="s1")
+        self.assertIn("/setup", out["hookSpecificOutput"]["additionalContext"])
+        self.assertNotIn("systemMessage", out)
+
+
+class ThreadCheckTest(unittest.TestCase):
+    def test_thread_check_160k(self):
+        h = Home()
+        t = os.path.join(h.path, "t.jsonl")
+        transcript(t, 165_000)
+        out = hook(h, "thread-check", session_id="a", transcript_path=t)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("/gigi:fresh-start", ctx)
+        self.assertIn("165K", ctx)
+        self.assertEqual(out["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit")
+
+    def test_thread_check_once(self):
+        h = Home()
+        t = os.path.join(h.path, "t.jsonl")
+        transcript(t, 165_000)
+        self.assertIsNotNone(hook(h, "thread-check", session_id="a", transcript_path=t))
+        self.assertIsNone(hook(h, "thread-check", session_id="a", transcript_path=t))
+        transcript(t, 182_000)
+        self.assertIsNotNone(hook(h, "thread-check", session_id="a", transcript_path=t))
+        self.assertIsNone(hook(h, "thread-check", session_id="a", transcript_path=t))
+        transcript(t, 820_000)
+        self.assertIn("820K", hook(h, "thread-check", session_id="a", transcript_path=t)["hookSpecificOutput"]["additionalContext"])
+
+    def test_thread_check_quiet(self):
+        h = Home()
+        t = os.path.join(h.path, "t.jsonl")
+        transcript(t, 100_000)
+        self.assertIsNone(hook(h, "thread-check", session_id="a", transcript_path=t))
+        transcript(t, 300_000)
+        self.assertIsNone(hook(h, "thread-check", session_id="a", transcript_path=t))
+
+    def test_thread_check_missing(self):
+        h = Home()
+        self.assertIsNone(hook(h, "thread-check", session_id="a", transcript_path=os.path.join(h.path, "nope.jsonl")))
+        for stdin in ["", "not json", "[]"]:
+            r = h.run("thread-check", stdin=stdin)
+            self.assertEqual((r.returncode, r.stdout), (0, ""), stdin)
+
+    def test_thread_check_big_is_fast(self):
+        h = Home()
+        t = os.path.join(h.path, "big.jsonl")
+        transcript(t, 170_000, pad_bytes=300 * 2**20)
+        started = time.time()
+        sys.path.insert(0, SCRIPTS)
+        self.assertEqual(coach.thread_tokens(t), 170_000)
+        self.assertLess(time.time() - started, 0.2)
+
+
 if __name__ == "__main__":
     unittest.main()

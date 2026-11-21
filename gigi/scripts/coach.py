@@ -12,16 +12,10 @@ It only reads. The hooks print nothing when there is nothing to say and never fa
 """
 import json
 import os
-import platform
-import subprocess
 import sys
 import time
-import urllib.parse
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import sweep  # noqa: E402  (Gigi's thread sweep, the same file she ships)
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 KIT_REL = os.path.join("Documents", "Claude Code", "agentic-business-os-pkg")
 FEED = "https://downloads.claude.ai/releases/darwin/universal/RELEASES.json"
@@ -65,11 +59,28 @@ def meter(home):
 
 
 def thread_tokens(path):
-    """How much context this thread's latest reply carried, read from the transcript's tail only."""
+    """How much context this thread's latest reply carried, read from the transcript's last megabyte, newest line first."""
     try:
-        return sweep.context_now(path) if path and os.path.isfile(path) else None
-    except Exception:
+        size = os.path.getsize(path)
+        with open(path, "rb") as h:
+            h.seek(max(0, size - 2**20))
+            lines = h.read().splitlines()
+    except (OSError, TypeError):
         return None
+    for raw in reversed(lines):
+        if b'"usage"' not in raw or b'"assistant"' not in raw:
+            continue
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            continue
+        if d.get("type") != "assistant" or d.get("isSidechain"):
+            continue
+        u = (d.get("message") or {}).get("usage") or {}
+        ctx = (u.get("input_tokens") or 0) + (u.get("cache_read_input_tokens") or 0) + (u.get("cache_creation_input_tokens") or 0)
+        if ctx:
+            return ctx
+    return None
 
 
 def window(tokens):
@@ -77,6 +88,7 @@ def window(tokens):
 
 
 def handoff_link(kit, note):
+    import urllib.parse
     rel = os.path.relpath(note, kit)
     q = f"Read {rel} and carry on from where it leaves off. First tell me in two lines where we are and what's next."
     return "claude://code/new?" + urllib.parse.urlencode({"q": q, "folder": kit, "source": "gigi"}, quote_via=urllib.parse.quote)
@@ -85,6 +97,7 @@ def handoff_link(kit, note):
 # ---- checkup
 
 def sh(cmd, timeout=12):
+    import subprocess
     try:
         r = subprocess.run(["/bin/zsh", "-lc", cmd], capture_output=True, text=True, timeout=timeout)
         return r.returncode == 0, r.stdout
@@ -93,6 +106,7 @@ def sh(cmd, timeout=12):
 
 
 def app_version():
+    import subprocess
     try:
         out = subprocess.run(["/usr/bin/defaults", "read", "/Applications/Claude.app/Contents/Info", "CFBundleShortVersionString"],
                              capture_output=True, text=True, timeout=5).stdout.strip()
@@ -102,6 +116,7 @@ def app_version():
 
 
 def latest_version():
+    import urllib.request
     try:
         with urllib.request.urlopen(FEED, timeout=5) as r:
             return json.load(r).get("currentRelease")
@@ -120,6 +135,7 @@ def newer_or_same(installed, latest):
 
 def checkup(home, cwd, quick=False):
     """Gigi's checkup, worded for Claude Code. quick skips the checks that run programs or reach the internet."""
+    from concurrent.futures import ThreadPoolExecutor
     rows = []
     kit = find_kit(cwd, home)
     slow = {}
@@ -161,6 +177,85 @@ def checkup(home, cwd, quick=False):
     return rows
 
 
+# ---- the two quiet checks (hooks): they tell, never block, and print nothing when there is nothing to say
+
+def said_file(home):
+    return os.path.join(home, ".claude", "gigi-plugin", "said.json")
+
+
+def first_time(home, session, key):
+    """True the first time this note comes up in this thread; remembered for the newest 200 threads."""
+    p = said_file(home)
+    try:
+        with open(p) as h:
+            said = json.load(h)
+    except (OSError, ValueError):
+        said = {}
+    keys = said.pop(session, [])
+    fresh = key not in keys
+    said[session] = keys + ([key] if fresh else [])
+    said = dict(list(said.items())[-200:])
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = p + ".tmp"
+    with open(tmp, "w") as h:
+        json.dump(said, h)
+    os.replace(tmp, p)
+    return fresh
+
+
+def k(n):
+    return f"{round(n / 1000)}K"
+
+
+def session_start(home, payload):
+    cwd = payload.get("cwd") or os.getcwd()
+    show, notes = [], []
+    m = meter(home)
+    if m and m["age_min"] < 360:
+        if (m.get("fh") or 0) >= 80:
+            show.append(f"{m['fh']}% of your 5-hour Claude limit")
+        if (m.get("sd") or 0) >= 80:
+            show.append(f"{m['sd']}% of this week's plan")
+    if show:
+        line = " and ".join(show)
+        notes.append(f"Gigi plugin: the person has used {line} (the Claude app's meter, {m['age_min']} min old). If they start something "
+                     "heavy, mention it once in one line and suggest /gigi:usage. Don't block or repeat it.")
+    if is_kit(cwd) and not setup_done(cwd):
+        notes.append("Gigi plugin: this AgentOS kit's setup interview hasn't run (context/me.md or context/current-priorities.md is "
+                     "missing), so Claude doesn't know their business yet. Early on, suggest once that they type /setup (about 25 minutes).")
+    if not notes:
+        return None
+    out = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "\n".join(notes)}}
+    if show:
+        out["systemMessage"] = f"Gigi: you've used {line}. Fresh threads and lighter work stretch it; /gigi:usage has the details."
+    return out
+
+
+def thread_check(home, payload):
+    tokens = thread_tokens(payload.get("transcript_path"))
+    if not tokens:
+        return None
+    w = window(tokens)
+    marks = [m for m in ((160_000, 180_000) if w == 200_000 else (800_000, 900_000)) if tokens >= m]
+    if not marks or not first_time(home, str(payload.get("session_id") or "none"), f"{w}:{marks[-1]}"):
+        return None
+    note = (f"Gigi plugin: this thread is now {k(tokens)} tokens long ({round(tokens * 100 / w)}% of its {k(w)} window), so every "
+            "reply is slower and uses more of their plan, and details may get lost when Claude compacts it. Before answering, tell them "
+            "in one short line and offer /gigi:fresh-start (a handoff note and a new thread with it). Say it once, then do what they asked.")
+    return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": note}}
+
+
+def run_hook(fn, home):
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+        out = fn(home, payload if isinstance(payload, dict) else {})
+        if out:
+            print(json.dumps(out))
+    except Exception:
+        pass
+    return 0
+
+
 # ---- the CLI
 
 def main(argv):
@@ -168,12 +263,18 @@ def main(argv):
     cmd = argv[1] if len(argv) > 1 else ""
     if cmd == "usage":
         try:
+            sys.path.insert(0, HERE)
+            import sweep  # Gigi's thread sweep, the same file she ships; only usage needs it
             out = sweep.usage(home)
         except Exception:
             out = {"meter": meter(home), "threads": []}
         print(json.dumps(out))
     elif cmd == "checkup":
         print(json.dumps(checkup(home, os.getcwd())))
+    elif cmd == "session-start":
+        return run_hook(session_start, home)
+    elif cmd == "thread-check":
+        return run_hook(thread_check, home)
     elif cmd == "kit":
         print(find_kit(os.getcwd(), home) or "")
     elif cmd == "handoff-link" and len(argv) > 2:
@@ -181,7 +282,8 @@ def main(argv):
         kit = find_kit(os.getcwd(), home) or os.path.dirname(os.path.dirname(note))
         link = handoff_link(kit, note)
         print(link)
-        if platform.system() == "Darwin" and "--no-open" not in argv:
+        if sys.platform == "darwin" and "--no-open" not in argv:
+            import subprocess
             subprocess.run(["/usr/bin/open", link], check=False)
     else:
         print(__doc__.strip())
